@@ -1381,7 +1381,13 @@ window.submitPatient = async function () {
   const name = document.getElementById("name")?.value;
   const age = document.getElementById("age")?.value;
   const gender = document.getElementById("gender")?.value;
+  const diseasesRaw = document.getElementById("diseases")?.value || "";
   const notes = document.getElementById("notes")?.value;
+
+  const diseases = diseasesRaw
+    .split(",")
+    .map(v => v.trim())
+    .filter(Boolean);
 
   if (!pid || !name) {
     alert("Patient ID and Name are required");
@@ -1392,10 +1398,21 @@ window.submitPatient = async function () {
     const res = await fetch("http://127.0.0.1:5000/add_patient", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pid, name, age, gender, notes })
+      body: JSON.stringify({ pid, name, age, gender, notes, diseases })
     });
 
     const data = await res.json();
+
+    if (!res.ok) {
+      const message = data.error || "Failed to add patient";
+
+      const statusEl = document.getElementById("status");
+      if (statusEl) {
+        statusEl.innerText = message;
+        statusEl.style.color = "red";
+      }
+      return;
+    }
 
 const statusEl = document.getElementById("status");
 statusEl.innerText = data.status || "Patient added successfully ✅";

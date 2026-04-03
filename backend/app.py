@@ -9,6 +9,24 @@ def run_query(query, params=None):
         result = session.run(query, params or {})
         return [r.data() for r in result]
 
+
+def resolve_disease_name(session, disease_name):
+    raw_name = str(disease_name or "").strip()
+    if not raw_name:
+        return ""
+
+    record = session.run(
+        """
+        MATCH (d:Disease)
+        WHERE toLower(trim(d.name)) = toLower(trim($name))
+        RETURN d.name AS name
+        LIMIT 1
+        """,
+        name=raw_name,
+    ).single()
+
+    return (record["name"].strip() if record and record.get("name") else raw_name)
+
 app = Flask(__name__)
 CORS(app)
 
@@ -40,28 +58,99 @@ def test_neo4j():
 @app.route("/add_patient", methods=["POST"])
 def add_patient():
     try:
-        data = request.json
+        data = request.json or {}
         print("RECEIVED DATA:", data)
+
+        pid = (data.get("pid") or "").strip()
+        name = data.get("name")
+        age = data.get("age")
+        gender = data.get("gender")
+        notes = (data.get("notes") or "").strip()
+
+        if not pid or not name:
+            return jsonify({"error": "Patient ID and name are required"}), 400
+
+        raw_diseases = data.get("diseases", [])
+        if isinstance(raw_diseases, str):
+            raw_diseases = raw_diseases.split(",")
+        elif not isinstance(raw_diseases, list):
+            raw_diseases = []
+
+        diseases = []
+        seen = set()
+        for item in raw_diseases:
+            disease = str(item or "").strip()
+            key = disease.lower()
+            if disease and key not in seen:
+                seen.add(key)
+                diseases.append(disease)
         
-        query = """
-        MERGE (p:Patient {id: toUpper(trim($pid))})
-        SET p.name = $name,
-            p.age = $age,
-            p.gender = $gender,
-            p.notes = $notes
-        """
-            
         with driver.session() as session:
+            existing = session.run(
+                """
+                MATCH (p:Patient {id: toUpper(trim($pid))})
+                RETURN count(p) AS total
+                """,
+                pid=pid,
+            ).single()
+
+            if existing and existing["total"] > 0:
+                return jsonify({"error": "Patient ID already exists"}), 409
+
+            query = """
+            CREATE (p:Patient {id: toUpper(trim($pid))})
+            SET p.name = $name,
+                p.age = $age,
+                p.gender = $gender,
+                p.notes = $notes
+            """
             session.run(
                 query,
-                pid=data["pid"].strip(),
-                name=data["name"],
-                age=data["age"],
-                gender=data["gender"],
-                notes=data["notes"]
+                pid=pid,
+                name=name,
+                age=age,
+                gender=gender,
+                notes=notes
             )
 
-        return jsonify({"status": "Patient added successfully"}), 200
+            # If diseases were not explicitly provided, try inferring from notes
+            # by matching known disease names already present in the graph.
+            if not diseases and notes:
+                inferred = session.run(
+                    """
+                    MATCH (d:Disease)
+                    WHERE toLower($notes) CONTAINS toLower(d.name)
+                    RETURN collect(DISTINCT d.name) AS diseases
+                    """,
+                    notes=notes
+                ).single()
+
+                for item in (inferred["diseases"] if inferred else []):
+                    disease = str(item or "").strip()
+                    key = disease.lower()
+                    if disease and key not in seen:
+                        seen.add(key)
+                        diseases.append(disease)
+
+            for disease in diseases:
+                canonical_disease = resolve_disease_name(session, disease)
+                if not canonical_disease:
+                    continue
+
+                session.run(
+                    """
+                    MATCH (p:Patient {id: toUpper(trim($pid))})
+                    MERGE (d:Disease {name:$disease})
+                    MERGE (p)-[:HAS_DISEASE]->(d)
+                    """,
+                    pid=pid,
+                    disease=canonical_disease
+                )
+
+        return jsonify({
+            "status": "Patient added successfully",
+            "linked_diseases": diseases
+        }), 200
 
     except Exception as e:
         print("❌ ERROR in /add_patient:", e)
@@ -102,6 +191,8 @@ def import_csv():
 
                 # 2️⃣ Create Disease + Relationship
                 if disease:
+                    canonical_disease = resolve_disease_name(session, disease)
+
                     session.run(
                         """
                         MATCH (p:Patient {id: toUpper(trim($pid))})
@@ -109,7 +200,7 @@ def import_csv():
                         MERGE (p)-[:HAS_DISEASE]->(d)
                         """,
                         pid=pid,
-                        disease=disease
+                        disease=canonical_disease
                     )
 
                 print(f"✅ Imported {pid} → {disease}")
@@ -130,17 +221,25 @@ def import_csv():
 def link_patient_disease():
     data = request.json
 
-    query = """
-    MATCH (p:Patient {id:$pid})
-    MERGE (d:Disease {name:$disease})
-    MERGE (p)-[:HAS_DISEASE]->(d)
-    """
+    pid = (data.get("pid") or "").strip().upper()
+    disease_raw = (data.get("disease") or "").strip()
+    if not pid or not disease_raw:
+        return {"error": "Patient ID and disease are required"}, 400
+
     with driver.session() as session:
+        disease = resolve_disease_name(session, disease_raw)
+
+        query = """
+        MATCH (p:Patient {id:$pid})
+        MERGE (d:Disease {name:$disease})
+        MERGE (p)-[:HAS_DISEASE]->(d)
+        """
+
         session.run(
-        query,
-        pid=data["pid"].strip().upper(),
-        disease=data["disease"]
-    )
+            query,
+            pid=pid,
+            disease=disease,
+        )
 
     return {"status": "Disease linked successfully"}
 
@@ -150,14 +249,19 @@ def patient_insights(pid):
     query = """
     MATCH (p:Patient {id: toUpper(trim($pid))})
     OPTIONAL MATCH (p)-[:HAS_DISEASE]->(d:Disease)
-    OPTIONAL MATCH (drug:Drug)-[:TREATS]->(d)
-    OPTIONAL MATCH (drug)-[:TARGETS]->(g:Gene)
+    WITH p, [item IN collect(DISTINCT d) WHERE item IS NOT NULL] AS patient_diseases
+    OPTIONAL MATCH (canonical_d:Disease)
+    WHERE any(pd IN patient_diseases WHERE toLower(trim(pd.name)) = toLower(trim(canonical_d.name)))
+    OPTIONAL MATCH (drug:Drug)-[:TREATS]->(canonical_d)
+    OPTIONAL MATCH (drug)-[:TARGETS]->(target_g:Gene)
+    OPTIONAL MATCH (assoc_g:Gene)-[:ASSOCIATED_WITH]->(canonical_d)
     RETURN
         p.name AS patient_name,
         p.id AS patient_id,
-        collect(DISTINCT d.name) AS diseases,
+        [name IN [pd IN patient_diseases | pd.name] WHERE name IS NOT NULL] AS diseases,
         collect(DISTINCT drug.name) AS drugs,
-        collect(DISTINCT g.name) AS genes
+        collect(DISTINCT target_g.name) AS target_genes,
+        collect(DISTINCT assoc_g.name) AS associated_genes
     """
     with driver.session() as session:
         record = session.run(query, pid=pid.strip()).single()
@@ -165,12 +269,16 @@ def patient_insights(pid):
     if not record:
         return jsonify({"error": "Patient not found"}), 404
 
+    target_genes = [g for g in (record["target_genes"] or []) if g]
+    associated_genes = [g for g in (record["associated_genes"] or []) if g]
+    genes = sorted(set(target_genes + associated_genes))
+
     return jsonify({
         "patient_id": record["patient_id"],
         "patient_name": record["patient_name"],
         "diseases": record["diseases"],
         "drugs": record["drugs"],
-        "genes": record["genes"]
+        "genes": genes
     })
 
 # --------------------
@@ -196,9 +304,24 @@ def get_graph():
                 label = list(n.labels)[0]
 
                 if label == "Patient":
-                    node_id = f"Patient:{n.get('id')}"
+                    patient_id = str(n.get("id") or "").strip().upper()
+                    node_id = f"Patient:{patient_id}"
+                    node_name = node_id
+                elif label == "Disease":
+                    disease_name = str(n.get("name") or "").strip()
+                    if not disease_name:
+                        continue
+
+                    # Collapse Disease:Fever and Disease:fever into one visual node.
+                    node_id = f"Disease:{disease_name.lower()}"
+                    node_name = f"Disease:{disease_name}"
                 else:
-                    node_id = f"{label}:{n.get('name')}"
+                    raw_name = str(n.get("name") or "").strip()
+                    if not raw_name:
+                        continue
+
+                    node_id = f"{label}:{raw_name}"
+                    node_name = node_id
 
         
 
@@ -210,7 +333,7 @@ def get_graph():
                 nodes.append({
                     "id": node_id,
                     "label": list(n.labels)[0],
-                    "name": node_id
+                    "name": node_name
                 })
 
             # 2️⃣ Fetch relationships
@@ -232,6 +355,11 @@ def get_graph():
                     label = list(n.labels)[0]
                     if label == "Patient":
                         return f"Patient:{n.get('id').strip().upper()}"
+                    elif label == "Disease":
+                        disease_name = str(n.get("name") or "").strip()
+                        if not disease_name:
+                            return None
+                        return f"Disease:{disease_name.lower()}"
                     else:
                         return f"{label}:{n.get('name')}"
 
